@@ -1194,7 +1194,6 @@ textarea, input{ -webkit-appearance:none; }
   <header id="app-header">
     <span class="title neon-text" id="header-title" onclick="editAppTitle()" style="cursor:pointer;">Los Pibes Argentinos</span>
     <div class="row" style="gap:.5rem;">
-      <button class="small-btn" onclick="simulateCall('fede')">📞 Simular llamada</button>
     </div>
   </header>
 
@@ -2215,7 +2214,7 @@ textarea, input{ -webkit-appearance:none; }
         </div>
         <div class="chat-header-icons">
           <button class="icon-btn" id="mute-chat-btn" onclick="toggleMuteChat()">🔔</button>
-          <button class="icon-btn" onclick="currentChat!=='group' ? simulateCall(currentChat) : openGroupCall()">🎥</button>
+          <button class="icon-btn" onclick="currentChat!=='group' ? startRealCall(currentChat) : openGroupCall()">🎥</button>
         </div>
       </div>
       <div id="pinned-announcement-banner" hidden></div>
@@ -2261,8 +2260,21 @@ textarea, input{ -webkit-appearance:none; }
     <div class="call-name" id="call-name">·</div>
   </div>
   <div class="call-actions">
-    <button class="call-btn reject" onclick="endCall()">✕</button>
-    <button class="call-btn accept" onclick="acceptCall()">✓</button>
+    <button class="call-btn reject" onclick="rejectRealCall()">✕</button>
+    <button class="call-btn accept" onclick="acceptRealCall()">✓</button>
+  </div>
+</div>
+
+<div class="overlay" id="overlay-outgoing-call" hidden>
+  <div class="pulse-ring">
+    <div class="avatar xl" id="outgoing-call-avatar">·</div>
+  </div>
+  <div>
+    <div class="call-label">Llamando...</div>
+    <div class="call-name" id="outgoing-call-name">·</div>
+  </div>
+  <div class="call-actions">
+    <button class="call-btn reject" onclick="cancelOutgoingCall()">✕</button>
   </div>
 </div>
 
@@ -3281,6 +3293,7 @@ function enterApp(){
           if(payload.new.status==='accepted' && (payload.new.from_id===myRealId || payload.new.to_id===myRealId)){ loadRealFriends(); }
         })
         .subscribe();
+      subscribeRealtimeCalls();
     }
   }, 650);
 }
@@ -4098,28 +4111,74 @@ function triggerAttentionBolts(){
   if(navigator.vibrate) navigator.vibrate([40,40,40,40,90]);
 }
 let currentCallFriendId = null;
-function simulateCall(id){
-  currentCallFriendId = id;
-  const f = friendById(id);
-  triggerAttentionBolts();
-  showTopNotif(initials(f.nick), f.color, f.nick, '📞 Videollamada entrante...', null);
-  document.getElementById('call-avatar').style.background = f.color;
-  document.getElementById('call-avatar').textContent = initials(f.nick);
-  document.getElementById('call-name').textContent = f.nick;
-  document.getElementById('call-bg-fx').innerHTML = myProfile.bgEffect ? bgEffectHTML(myProfile.bgEffect) : '';
+let currentOutgoingCallId = null;
+async function startRealCall(friendId){
+  if(!sb || !myRealId) return;
+  const f = friendById(friendId);
+  const room = 'lospibesargentinos-'+[myRealId, friendId].sort().join('-');
+  const { data, error } = await sb.from('calls').insert({ from_id: myRealId, to_id: friendId, room_name: room, status:'ringing' }).select().single();
+  if(error){ showToast('⚠️ No se pudo iniciar la llamada'); return; }
+  currentOutgoingCallId = data.id;
+  document.getElementById('outgoing-call-name').textContent = f ? f.nick : friendId;
+  document.getElementById('outgoing-call-avatar').style.background = f ? f.color : '#666';
+  document.getElementById('outgoing-call-avatar').textContent = f ? initials(f.nick) : '?';
+  document.getElementById('overlay-outgoing-call').hidden = false;
+}
+async function cancelOutgoingCall(){
+  if(currentOutgoingCallId) await sb.from('calls').update({status:'cancelled'}).eq('id', currentOutgoingCallId);
+  document.getElementById('overlay-outgoing-call').hidden = true;
+  currentOutgoingCallId = null;
+}
+let currentIncomingCall = null;
+function showIncomingCall(call, fromProfile){
+  currentIncomingCall = call;
+  document.getElementById('call-avatar').style.background = 'linear-gradient(135deg,#ff3d8a,#3de8ff)';
+  document.getElementById('call-avatar').textContent = initials(fromProfile ? fromProfile.nick : call.from_id);
+  document.getElementById('call-name').textContent = fromProfile ? fromProfile.nick : call.from_id;
+  document.getElementById('call-bg-fx').innerHTML = '';
   document.getElementById('overlay-call').hidden = false;
   if(navigator.vibrate) navigator.vibrate([300,150,300,150,300]);
 }
+async function acceptRealCall(){
+  if(!currentIncomingCall) return;
+  await sb.from('calls').update({status:'accepted'}).eq('id', currentIncomingCall.id);
+  document.getElementById('overlay-call').hidden = true;
+  openRealVideoCall(currentIncomingCall.room_name, '');
+  currentIncomingCall = null;
+}
+async function rejectRealCall(){
+  if(!currentIncomingCall) return;
+  await sb.from('calls').update({status:'rejected'}).eq('id', currentIncomingCall.id);
+  document.getElementById('overlay-call').hidden = true;
+  currentIncomingCall = null;
+}
+function subscribeRealtimeCalls(){
+  if(!sb || !myRealId) return;
+  sb.channel('public:calls')
+    .on('postgres_changes', { event:'INSERT', schema:'public', table:'calls' }, async payload=>{
+      const call = payload.new;
+      if(call.to_id === myRealId && call.status==='ringing'){
+        const { data: fromProfile } = await sb.from('profiles').select('*').eq('id', call.from_id).maybeSingle();
+        showIncomingCall(call, fromProfile);
+      }
+    })
+    .on('postgres_changes', { event:'UPDATE', schema:'public', table:'calls' }, payload=>{
+      const call = payload.new;
+      if(call.from_id === myRealId && call.id === currentOutgoingCallId){
+        if(call.status==='accepted'){
+          document.getElementById('overlay-outgoing-call').hidden = true;
+          openRealVideoCall(call.room_name, '');
+          currentOutgoingCallId = null;
+        } else if(call.status==='rejected'){
+          document.getElementById('overlay-outgoing-call').hidden = true;
+          showToast('📵 Llamada rechazada');
+          currentOutgoingCallId = null;
+        }
+      }
+    })
+    .subscribe();
+}
 let jitsiApi = null;
-function acceptCall(){
-  document.getElementById('overlay-call').hidden = true;
-  const f = friendById(currentCallFriendId);
-  openRealVideoCall('lospibesargentinos-'+[myProfile.nick, f.nick].sort().join('-').toLowerCase().replace(/[^a-z0-9-]/g,''), f.nick);
-}
-function endCall(){
-  document.getElementById('overlay-call').hidden = true;
-  closeRealVideoCall();
-}
 function openRealVideoCall(roomName, displayTitle){
   document.getElementById('real-call-overlay').hidden = false;
   const domain = 'meet.jit.si';
